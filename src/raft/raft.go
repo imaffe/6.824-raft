@@ -307,6 +307,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *RequestVoteReply) bool {
 	ok := rf.peers[server].Call("Raft.RequestVote", args, reply)
 	if rf.hasCurrentTermChangedDuringRpc(args.RequestTerm) {
+		Debug(dError, "S%d -> S%d currentTerm has changed during RequestVote RPC", rf.me, server)
 		return false
 	}
 	return ok
@@ -317,6 +318,7 @@ func (rf *Raft) goSendRequestVoteAndHandle(server int, args *RequestVoteArgs, re
 	validReply := rf.sendRequestVote(server, args, reply)
 	if !validReply {
 		// drop the reply if not valid or timeouted
+		Debug(dVote, "S%d -> S%d received invalid reply from peer: %d", rf.me, server, server)
 		return
 	}
 
@@ -326,6 +328,7 @@ func (rf *Raft) goSendRequestVoteAndHandle(server int, args *RequestVoteArgs, re
 		defer rf.raftLock.Unlock()
 		peerTerm := reply.ReplyTerm
 		if peerTerm > rf.currentTerm {
+			Debug(dVote, "S%d -> S%d higher term from peer,term:%d,peeTerm:%d", rf.me, server, rf.currentTerm, peerTerm)
 			// fall back to follower state
 			rf.currentTerm = peerTerm
 			rf.role = Follower
