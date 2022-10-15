@@ -15,6 +15,8 @@ TOPICS = {
     "CAND": "purple",
     "LOCK": "cyan",
     "VOTE": "green",
+    "LEAD": "blue",
+    "FOLW": "pink",
 }
 
 topics = {
@@ -24,7 +26,9 @@ topics = {
     "ROLE",
     "CAND",
     "LOCK",
-    "VOTE"
+    "VOTE",
+    "LEAD",
+    "FOLW",
 }
 
 

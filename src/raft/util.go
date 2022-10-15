@@ -55,3 +55,8 @@ func Debug(topic logTopic, format string, a ...interface{}) {
 	}
 }
 
+func GetTimeSinceStart(t time.Time) int64 {
+	time := t.Sub(debugStart).Milliseconds()
+	return time
+}
+

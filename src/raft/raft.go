@@ -19,6 +19,10 @@ package raft
 
 import (
 	"math/rand"
+	"runtime"
+	"strconv"
+	"strings"
+
 	//	"bytes"
 	"sync"
 	"sync/atomic"
@@ -43,23 +47,22 @@ import (
 type logTopic string
 
 const (
-
-	dClient    logTopic = "CLNT"
-	dCommit    logTopic = "CMIT"
-	dDrop      logTopic = "DROP"
-	dError     logTopic = "ERRO"
-	dInfo      logTopic = "INFO"
-	dLeader    logTopic = "LEAD"
-	dLog       logTopic = "LOG1"
-	dLog2      logTopic = "LOG2"
-	dPersist   logTopic = "PERS"
-	dSnap      logTopic = "SNAP"
-	dTerm      logTopic = "TERM"
-	dTest      logTopic = "TEST"
-	dTimer     logTopic = "TIMR"
-	dTrace     logTopic = "TRCE"
-	dVote      logTopic = "VOTE"
-	dWarn      logTopic = "WARN"
+	dClient  logTopic = "CLNT"
+	dCommit  logTopic = "CMIT"
+	dDrop    logTopic = "DROP"
+	dError   logTopic = "ERRO"
+	dInfo    logTopic = "INFO"
+	dLeader  logTopic = "LEAD"
+	dLog     logTopic = "LOG1"
+	dLog2    logTopic = "LOG2"
+	dPersist logTopic = "PERS"
+	dSnap    logTopic = "SNAP"
+	dTerm    logTopic = "TERM"
+	dTest    logTopic = "TEST"
+	dTimer   logTopic = "TIMR"
+	dTrace   logTopic = "TRCE"
+	dVote    logTopic = "VOTE"
+	dWarn    logTopic = "WARN"
 	// newly added topics for me
 	dRole      logTopic = "ROLE"
 	dFollower  logTopic = "FOLW"
@@ -68,8 +71,8 @@ const (
 )
 
 const (
-	ElectionTimeoutLowerMs int64 = 400
-	ElectionTimeoutUpperMs int64 = 800
+	ElectionTimeoutLowerMs int64 = 500
+	ElectionTimeoutUpperMs int64 = 900
 
 	Follower  Role = 0
 	Candidate Role = 1
@@ -240,6 +243,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	if peerTerm > rf.currentTerm {
 		// when the peerTerm is higher than currentTerm in a RequestVote RPC, means the peer is in candidate state.
 		// fall back to follower state
+		Debug(dRole, "S%d -> S%d, saw higher term in RequestVote, currentTerm: %d, peerTerm: %d", rf.me, args.CandidateId, rf.currentTerm, peerTerm)
 		rf.currentTerm = peerTerm
 		rf.role = Follower
 		// TODO when converting back to follower, should we reset the Timer ? should we reset the votedFor ? Should we reject the response ?
@@ -257,6 +261,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	if args.RequestTerm < currentTerm {
 		reply.ReplyTerm = currentTerm
 		reply.VoteGranted = false
+		Debug(dVote, "S%d <- S%d, Request Vote rejected peer term low, currentTerm: %d, peerTerm: %d", rf.me, args.CandidateId, currentTerm, peerTerm)
 		return
 	}
 
@@ -266,11 +271,14 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		reply.ReplyTerm = currentTerm
 		reply.VoteGranted = true
 		rf.votedFor = args.CandidateId
+		// TODO seems we don't need to reset the timer here, but doesn't matter
 		rf.resetElectionTimer()
+		Debug(dVote, "S%d <- S%d, Request Vote Granted, currentTerm: %d, peerTerm: %d", rf.me, args.CandidateId, currentTerm, peerTerm)
 		return
 	} else {
 		reply.ReplyTerm = currentTerm
 		reply.VoteGranted = false
+		Debug(dVote, "S%d <- S%d, Request Vote rejected, already voted, currentTerm: %d, peerTerm: %d", rf.me, args.CandidateId, currentTerm, peerTerm)
 		return
 	}
 }
@@ -306,19 +314,25 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 //
 func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *RequestVoteReply) bool {
 	ok := rf.peers[server].Call("Raft.RequestVote", args, reply)
-	if rf.hasCurrentTermChangedDuringRpc(args.RequestTerm) {
-		Debug(dError, "S%d -> S%d currentTerm has changed during RequestVote RPC", rf.me, server)
+	if changed, currentTerm := rf.hasCurrentTermChangedDuringRpc(server, args.RequestTerm); changed {
+		if args.RequestTerm != rf.currentTerm {
+			Debug(dError, "S%d -> S%d currentTerm has changed during RequestVote RPC, should be %d but now is %d", rf.me, server, args.RequestTerm, currentTerm)
+		}
 		return false
+	}
+
+	if !ok {
+		Debug(dError, "S%d -> S%d RPC call failed in RequestVote request", rf.me, server)
 	}
 	return ok
 }
 
 func (rf *Raft) goSendRequestVoteAndHandle(server int, args *RequestVoteArgs, reply *RequestVoteReply, votesGranted *int64) {
-	Debug(dVote, "S%d -> S%d send RequestVote to peer", rf.me, server)
+	Debug(dVote, "S%d -> S%d send RequestVote to peer, candi term %d", rf.me, server, args.RequestTerm)
 	validReply := rf.sendRequestVote(server, args, reply)
 	if !validReply {
 		// drop the reply if not valid or timeouted
-		Debug(dVote, "S%d -> S%d received invalid reply from peer: %d", rf.me, server, server)
+		Debug(dVote, "S%d -> S%d received invalid RequestVote reply from peer: %d", rf.me, server, server)
 		return
 	}
 
@@ -328,7 +342,7 @@ func (rf *Raft) goSendRequestVoteAndHandle(server int, args *RequestVoteArgs, re
 		defer rf.raftLock.Unlock()
 		peerTerm := reply.ReplyTerm
 		if peerTerm > rf.currentTerm {
-			Debug(dVote, "S%d -> S%d higher term from peer,term:%d,peeTerm:%d", rf.me, server, rf.currentTerm, peerTerm)
+			Debug(dVote, "S%d -> S%d saw higher term in RequestVoteReply,term:%d,peerTerm:%d", rf.me, server, rf.currentTerm, peerTerm)
 			// fall back to follower state
 			rf.currentTerm = peerTerm
 			rf.role = Follower
@@ -340,6 +354,7 @@ func (rf *Raft) goSendRequestVoteAndHandle(server int, args *RequestVoteArgs, re
 
 	if reply.VoteGranted {
 		atomic.AddInt64(votesGranted, 1)
+		Debug(dVote, "S%d -> S%d requestVote Granted, total: %d", rf.me, server, atomic.LoadInt64(votesGranted))
 	}
 }
 
@@ -363,6 +378,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	// We could be receiving appendEntries as Follower / Candidate / Leader
 	if peerTerm > rf.currentTerm {
 		// fall back to follower state
+		Debug(dError, "S%d <- S%d, saw higher term in AppendEntries, currentTerm: %d, peerTerm: %d", rf.me, args.LeaderId, rf.currentTerm, peerTerm)
 		rf.currentTerm = peerTerm
 		rf.role = Follower
 		// TODO when converting back to follower, should we reset the Timer ? should we reset the votedFor ?
@@ -375,9 +391,11 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	rf.raftLock.Unlock()
 
 	if args.RequestTerm < currentTerm {
+		Debug(dFollower, "S%d <- S%d, reject AppendEntries log, currentTerm: %d, peerTerm: %d", rf.me, args.LeaderId, rf.currentTerm, peerTerm)
 		reply.ReplyTerm = currentTerm
 		reply.Success = false
 	} else {
+		Debug(dFollower, "S%d <- S%d, accepted AppendEntries, currentTerm: %d, peerTerm: %d", rf.me, args.LeaderId, rf.currentTerm, peerTerm)
 		reply.ReplyTerm = currentTerm
 		reply.Success = true
 		rf.resetElectionTimer()
@@ -386,15 +404,23 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
 	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
-	if rf.hasCurrentTermChangedDuringRpc(args.RequestTerm) {
+	if changed, currentTerm := rf.hasCurrentTermChangedDuringRpc(server, args.RequestTerm); changed {
+		if args.RequestTerm != currentTerm {
+			Debug(dError, "S%d -> S%d currentTerm has changed during AppendEntries RPC, should be %d but now is %d, goId: %d", rf.me, server, args.RequestTerm, currentTerm, GoID())
+		}
 		return false
 	}
+
+	//if !ok {
+	//	Debug(dError, "S%d -> S%d RPC call returned false in AppendEntries", rf.me, server)
+	//}
 	return ok
 }
 
 func (rf *Raft) goSendAppendEntriesAndHandle(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	validReply := rf.sendAppendEntries(server, args, reply)
 	if !validReply {
+		Debug(dLeader, "S%d -> S%d, received invalid heartbeat reply from %d", rf.me, server, server)
 		// drop the reply if not valid or timeouted
 		return
 	}
@@ -405,6 +431,7 @@ func (rf *Raft) goSendAppendEntriesAndHandle(server int, args *AppendEntriesArgs
 		defer rf.raftLock.Unlock()
 		peerTerm := reply.ReplyTerm
 		if peerTerm > rf.currentTerm {
+			Debug(dRole, "S%d -> S%d, saw higher term in AppendEntries Reply, currentTerm: %d, peerTerm: %d", rf.me, server, rf.currentTerm, peerTerm)
 			// fall back to follower state
 			rf.currentTerm = peerTerm
 			rf.role = Follower
@@ -415,11 +442,10 @@ func (rf *Raft) goSendAppendEntriesAndHandle(server int, args *AppendEntriesArgs
 	}
 }
 
-func (rf *Raft) hasCurrentTermChangedDuringRpc(termInRpcRequest int) bool {
+func (rf *Raft) hasCurrentTermChangedDuringRpc(server int, termInRpcRequest int) (bool, int) {
 	rf.raftLock.Lock()
 	defer rf.raftLock.Unlock()
-
-	return termInRpcRequest != rf.currentTerm
+	return termInRpcRequest != rf.currentTerm, rf.currentTerm
 }
 
 // TODO should we compare with rf.currentTerm or the term included in the original RPC ?
@@ -501,11 +527,12 @@ func (rf *Raft) ticker() {
 		rf.electionTimerStartTimeLock.Unlock()
 
 		if rf.checkShouldStartElection(electionTimerStartTime) {
-			Debug(dTimer, "S%d election timer triggered", rf.me)
+			Debug(dTimer, "S%d election timer triggered, startTime: %d, currentTime: %d", rf.me, GetTimeSinceStart(electionTimerStartTime), GetTimeSinceStart(time.Now()))
 			rf.resetElectionTimer()
 			go rf.goCandidateStartNewElection()
 		} else {
-			rf.sleepUntilNextPossibleElectionTimeout(electionTimerStartTime)
+			nextScheduledTime := rf.sleepUntilNextPossibleElectionTimeout(electionTimerStartTime)
+			Debug(dTimer, "S%d Next possible Election timeout scheduled to: %d", rf.me, GetTimeSinceStart(nextScheduledTime))
 		}
 	}
 	Debug(dInfo, "S%d Killed, exit ticker", rf.me)
@@ -517,15 +544,18 @@ func (rf *Raft) checkShouldStartElection(electionTimerStartTime time.Time) bool 
 	return role == Follower && time.Now().Sub(electionTimerStartTime).Milliseconds() >= rf.ElectionTimeout
 }
 
-func (rf *Raft) sleepUntilNextPossibleElectionTimeout(electionTimerStartTime time.Time) {
+func (rf *Raft) sleepUntilNextPossibleElectionTimeout(electionTimerStartTime time.Time) time.Time {
 	time.Sleep(electionTimerStartTime.Add(time.Duration(rf.ElectionTimeout) * time.Millisecond).Sub(time.Now()))
+	return electionTimerStartTime.Add(time.Duration(rf.ElectionTimeout))
 }
 
 // reset the election timeout timer to time.Now()
 func (rf *Raft) resetElectionTimer() {
 	rf.electionTimerStartTimeLock.Lock()
 	defer rf.electionTimerStartTimeLock.Unlock()
-	rf.electionTimerStartTime = time.Now()
+	newStartTime := time.Now()
+	Debug(dTimer, "S%d reset Election Timer, newStartTime: %d", rf.me, GetTimeSinceStart(newStartTime))
+	rf.electionTimerStartTime = newStartTime
 	// TODO should we reset the voted for ? No
 }
 
@@ -547,7 +577,7 @@ func (rf *Raft) goCandidateStartNewElection() {
 	// composing requests and replies
 	requests := make([]RequestVoteArgs, len(rf.peers))
 	replys := make([]RequestVoteReply, len(rf.peers))
-
+	Debug(dCandidate, "S%d candidate term: %d", rf.me, thisElectionTerm)
 	for i := range requests {
 		requests[i] = RequestVoteArgs{
 			RequestTerm: thisElectionTerm,
@@ -577,10 +607,12 @@ func (rf *Raft) goCandidateStartNewElection() {
 		// However, in terms of timeout, how do we exit the process
 		if role == Follower {
 			// TODO if we are follower, should we return early and forget about the requests ? ?
+			Debug(dCandidate, "S%d became follower while waiting for votes", rf.me)
 			return
 		}
 		// this means the new election has started, we should give up this election
 		if term != thisElectionTerm {
+			Debug(dCandidate, "S%d candi's term changed while waiting for votes, should be %d but is %d", rf.me, thisElectionTerm, term)
 			return
 		}
 
@@ -591,6 +623,7 @@ func (rf *Raft) goCandidateStartNewElection() {
 	// only success when enough votes are granted
 	rf.raftLock.Lock()
 	if rf.hasEnoughVotes(int(atomic.LoadInt64(&votesGranted))) && rf.role == Candidate {
+		Debug(dCandidate, "S%d got enough votes, will become leader", rf.me)
 		rf.role = Leader
 		Debug(dRole, "S%d Role set to Leader", rf.me)
 		go rf.goLeaderStartNewTerm(rf.currentTerm)
@@ -599,15 +632,18 @@ func (rf *Raft) goCandidateStartNewElection() {
 	rf.raftLock.Unlock()
 }
 
-
 func (rf *Raft) hasEnoughVotes(votesGranted int) bool {
 	return votesGranted > len(rf.peers)/2
 }
 
 func (rf *Raft) goLeaderStartNewTerm(termOfCandidate int) {
 	role, currentTerm := rf.getRoleAndTerm()
+	//initialize the time
+	rf.setZeroLastSendAppendEntriesTime()
 	for !rf.killed() && role == Leader {
+		// Debug(dLeader, "S%d Leader entering heart beat loop, currentTerm:%d candidateTerm:%d", rf.me, currentTerm, termOfCandidate)
 		if currentTerm != termOfCandidate {
+
 			Debug(dError, "S%d is leader but term does not match, %d %d", rf.me, currentTerm, termOfCandidate)
 			// need to break the loop if term no longer matches
 			return
@@ -619,25 +655,27 @@ func (rf *Raft) goLeaderStartNewTerm(termOfCandidate int) {
 		lastAppendEntriesTime := rf.getLastSendAppendEntriesTime()
 
 		if lastAppendEntriesTime.IsZero() || time.Now().Sub(lastAppendEntriesTime).Milliseconds() >= HeartBeatIntervalMs {
-			go rf.goLeaderSendHeartBeats(termOfCandidate)
-			rf.setLastSendAppendEntriesTime()
+			// TODO do we go here ? wee do not need to go here because we can fire and forget
+			rf.goLeaderSendHeartBeats(termOfCandidate)
+			rf.refreshLastSendAppendEntriesTime()
 		} else {
 			time.Sleep(lastAppendEntriesTime.Add(time.Duration(HeartBeatIntervalMs) * time.Millisecond).Sub(time.Now()))
 		}
+
 		// check if role and term has changed
 		role, currentTerm = rf.getRoleAndTerm()
 	}
 }
 
-func (rf *Raft) goLeaderSendHeartBeats(currentTerm int) {
+func (rf *Raft) goLeaderSendHeartBeats(termOfCandidate int) {
 	// take a snapshot in case the term change suddenly
-
+	Debug(dLeader, "S%d Leader Start sending heartBeat,candidateTerm:%d", rf.me, termOfCandidate)
 	requests := make([]AppendEntriesArgs, len(rf.peers))
 	replys := make([]AppendEntriesReply, len(rf.peers))
 
 	for i := range requests {
 		requests[i] = AppendEntriesArgs{
-			RequestTerm: currentTerm,
+			RequestTerm: termOfCandidate,
 			LeaderId:    rf.me,
 		}
 		replys[i] = AppendEntriesReply{}
@@ -657,10 +695,18 @@ func (rf *Raft) getLastSendAppendEntriesTime() time.Time {
 	defer rf.lastSendAppendEntriesTimeLock.Unlock()
 	return rf.lastSendAppendEntriesTime
 }
-func (rf *Raft) setLastSendAppendEntriesTime() {
+
+func (rf *Raft) refreshLastSendAppendEntriesTime() {
 	rf.lastSendAppendEntriesTimeLock.Lock()
 	defer rf.lastSendAppendEntriesTimeLock.Unlock()
 	rf.lastSendAppendEntriesTime = time.Now()
+}
+
+func (rf *Raft) setZeroLastSendAppendEntriesTime() {
+	rf.lastSendAppendEntriesTimeLock.Lock()
+	defer rf.lastSendAppendEntriesTimeLock.Unlock()
+	var zeroTime time.Time
+	rf.lastSendAppendEntriesTime = zeroTime
 }
 
 func (rf *Raft) getRoleAndTerm() (Role, int) {
@@ -711,7 +757,6 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 func initializeRaftAsFollower(rf *Raft) {
 
-
 	// persist field
 	rf.currentTerm = 0
 	rf.votedFor = -1
@@ -735,4 +780,16 @@ func initializeRaftAsFollower(rf *Raft) {
 func setRandomElectionTimeout() int64 {
 	electionTimeoutInMs := rand.Int63n(ElectionTimeoutUpperMs-ElectionTimeoutLowerMs) + ElectionTimeoutLowerMs
 	return electionTimeoutInMs
+}
+
+// TODO this can be deleted
+func GoID() int {
+	var buf [64]byte
+	n := runtime.Stack(buf[:], false)
+	idField := strings.Fields(strings.TrimPrefix(string(buf[:n]), "goroutine "))[0]
+	id, err := strconv.Atoi(idField)
+	if err != nil {
+		panic(err)
+	}
+	return id
 }
