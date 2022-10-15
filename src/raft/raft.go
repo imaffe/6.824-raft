@@ -243,7 +243,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	if peerTerm > rf.currentTerm {
 		// when the peerTerm is higher than currentTerm in a RequestVote RPC, means the peer is in candidate state.
 		// fall back to follower state
-		Debug(dRole, "S%d -> S%d, saw higher term in RequestVote, currentTerm: %d, peerTerm: %d", rf.me, args.CandidateId, rf.currentTerm, peerTerm)
+		Debug(dRole, "S%d <- S%d, saw higher term in RequestVote, currentTerm: %d, peerTerm: %d", rf.me, args.CandidateId, rf.currentTerm, peerTerm)
 		rf.currentTerm = peerTerm
 		rf.role = Follower
 		// TODO when converting back to follower, should we reset the Timer ? should we reset the votedFor ? Should we reject the response ?
@@ -316,13 +316,13 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 	ok := rf.peers[server].Call("Raft.RequestVote", args, reply)
 	if changed, currentTerm := rf.hasCurrentTermChangedDuringRpc(server, args.RequestTerm); changed {
 		if args.RequestTerm != currentTerm {
-			Debug(dError, "S%d -> S%d currentTerm has changed during RequestVote RPC, should be %d but now is %d", rf.me, server, args.RequestTerm, currentTerm)
+			Debug(dInfo, "S%d -> S%d currentTerm has changed during RequestVote RPC, should be %d but now is %d", rf.me, server, args.RequestTerm, currentTerm)
 		}
 		return false
 	}
 
 	if !ok {
-		Debug(dError, "S%d -> S%d RPC call failed in RequestVote request", rf.me, server)
+		Debug(dInfo, "S%d -> S%d RPC call failed in RequestVote request", rf.me, server)
 	}
 	return ok
 }
@@ -340,7 +340,14 @@ func (rf *Raft) goSendRequestVoteAndHandle(server int, args *RequestVoteArgs, re
 	rf.raftLock.Lock()
 	defer rf.raftLock.Unlock()
 	peerTerm := reply.ReplyTerm
+	// TODO TODO could currentTerm changed here ?
+	// Check again. and continue processing
+	if rf.currentTerm != args.RequestTerm {
+		Debug(dError, "S%d -> S%d term has changed when processing RequestVoteRPC", rf.me, server, rf.currentTerm, peerTerm)
+		return
+	}
 	if peerTerm > rf.currentTerm {
+		// TODO should be currentTerm or args.RequestTerm ? since while waiting for reply we could see the term change
 		Debug(dVote, "S%d -> S%d saw higher term in RequestVoteReply,term:%d,peerTerm:%d", rf.me, server, rf.currentTerm, peerTerm)
 		// fall back to follower state
 		rf.currentTerm = peerTerm
@@ -352,7 +359,7 @@ func (rf *Raft) goSendRequestVoteAndHandle(server int, args *RequestVoteArgs, re
 
 	if reply.VoteGranted {
 		atomic.AddInt64(votesGranted, 1)
-		Debug(dVote, "S%d -> S%d requestVote Granted, total: %d", rf.me, server, atomic.LoadInt64(votesGranted))
+		Debug(dVote, "S%d -> S%d requestVote Granted, total: %d, for term: %d", rf.me, server, atomic.LoadInt64(votesGranted), args.RequestTerm)
 	}
 }
 
@@ -377,7 +384,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	// We could be receiving appendEntries as Follower / Candidate / Leader
 	if peerTerm > rf.currentTerm {
 		// fall back to follower state
-		Debug(dError, "S%d <- S%d, saw higher term in AppendEntries, currentTerm: %d, peerTerm: %d", rf.me, args.LeaderId, rf.currentTerm, peerTerm)
+		Debug(dInfo, "S%d <- S%d, saw higher term in AppendEntries, currentTerm: %d, peerTerm: %d", rf.me, args.LeaderId, rf.currentTerm, peerTerm)
 		rf.currentTerm = peerTerm
 		rf.role = Follower
 		// TODO when converting back to follower, should we reset the Timer ? should we reset the votedFor ?
@@ -405,7 +412,7 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
 	if changed, currentTerm := rf.hasCurrentTermChangedDuringRpc(server, args.RequestTerm); changed {
 		if args.RequestTerm != currentTerm {
-			Debug(dError, "S%d -> S%d currentTerm has changed during AppendEntries RPC, should be %d but now is %d, goId: %d", rf.me, server, args.RequestTerm, currentTerm, GoID())
+			Debug(dInfo, "S%d -> S%d currentTerm has changed during AppendEntries RPC, should be %d but now is %d, goId: %d", rf.me, server, args.RequestTerm, currentTerm, GoID())
 		}
 		return false
 	}
@@ -427,6 +434,11 @@ func (rf *Raft) goSendAppendEntriesAndHandle(server int, args *AppendEntriesArgs
 	// if AppendEntries found a higher term, fall back to follower, and should stop candidateProcess
 	rf.raftLock.Lock()
 	defer rf.raftLock.Unlock()
+	if rf.currentTerm != args.RequestTerm {
+		Debug(dError, "S%d -> S%d term has changed when processing AppendEntries RPC", rf.me, server, rf.currentTerm, peerTerm)
+		return
+	}
+
 	peerTerm := reply.ReplyTerm
 	if peerTerm > rf.currentTerm {
 		Debug(dRole, "S%d -> S%d, saw higher term in AppendEntries Reply, currentTerm: %d, peerTerm: %d", rf.me, server, rf.currentTerm, peerTerm)
@@ -642,7 +654,7 @@ func (rf *Raft) goLeaderStartNewTerm(termOfCandidate int) {
 		// Debug(dLeader, "S%d Leader entering heart beat loop, currentTerm:%d candidateTerm:%d", rf.me, currentTerm, termOfCandidate)
 		if currentTerm != termOfCandidate {
 
-			Debug(dError, "S%d is leader but term does not match, %d %d", rf.me, currentTerm, termOfCandidate)
+			Debug(dInfo, "S%d is leader but term does not match, %d %d", rf.me, currentTerm, termOfCandidate)
 			// need to break the loop if term no longer matches
 			return
 		}
