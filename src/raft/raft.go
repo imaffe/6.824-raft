@@ -435,7 +435,7 @@ func (rf *Raft) goSendAppendEntriesAndHandle(server int, args *AppendEntriesArgs
 	rf.raftLock.Lock()
 	defer rf.raftLock.Unlock()
 	if rf.currentTerm != args.RequestTerm {
-		Debug(dError, "S%d -> S%d term has changed when processing AppendEntries RPC", rf.me, server, rf.currentTerm, peerTerm)
+		Debug(dError, "S%d -> S%d term has changed when processing AppendEntries RPC, currentTerm: %d requesetTerm: %d", rf.me, server, rf.currentTerm, args.RequestTerm)
 		return
 	}
 
