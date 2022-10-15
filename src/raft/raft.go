@@ -315,7 +315,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *RequestVoteReply) bool {
 	ok := rf.peers[server].Call("Raft.RequestVote", args, reply)
 	if changed, currentTerm := rf.hasCurrentTermChangedDuringRpc(server, args.RequestTerm); changed {
-		if args.RequestTerm != rf.currentTerm {
+		if args.RequestTerm != currentTerm {
 			Debug(dError, "S%d -> S%d currentTerm has changed during RequestVote RPC, should be %d but now is %d", rf.me, server, args.RequestTerm, currentTerm)
 		}
 		return false
@@ -336,20 +336,18 @@ func (rf *Raft) goSendRequestVoteAndHandle(server int, args *RequestVoteArgs, re
 		return
 	}
 
-	{
-		// if RequestVote found a higher term, fall back to follower, and should stop candidateProcess
-		rf.raftLock.Lock()
-		defer rf.raftLock.Unlock()
-		peerTerm := reply.ReplyTerm
-		if peerTerm > rf.currentTerm {
-			Debug(dVote, "S%d -> S%d saw higher term in RequestVoteReply,term:%d,peerTerm:%d", rf.me, server, rf.currentTerm, peerTerm)
-			// fall back to follower state
-			rf.currentTerm = peerTerm
-			rf.role = Follower
-			rf.votedFor = -1
-			rf.resetElectionTimer()
-			return
-		}
+	// if RequestVote found a higher term, fall back to follower, and should stop candidateProcess
+	rf.raftLock.Lock()
+	defer rf.raftLock.Unlock()
+	peerTerm := reply.ReplyTerm
+	if peerTerm > rf.currentTerm {
+		Debug(dVote, "S%d -> S%d saw higher term in RequestVoteReply,term:%d,peerTerm:%d", rf.me, server, rf.currentTerm, peerTerm)
+		// fall back to follower state
+		rf.currentTerm = peerTerm
+		rf.role = Follower
+		rf.votedFor = -1
+		rf.resetElectionTimer()
+		return
 	}
 
 	if reply.VoteGranted {
@@ -372,6 +370,7 @@ type AppendEntriesReply struct {
 // TODO this is an RPC call, need to perform some checks
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	rf.raftLock.Lock()
+	defer rf.raftLock.Unlock()
 	peerTerm := args.RequestTerm
 
 	// TODO how to convert back to follower ? How to know the states ? Just stop any Candidate or Leader go routine ?
@@ -388,7 +387,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	}
 
 	currentTerm := rf.currentTerm
-	rf.raftLock.Unlock()
+
 
 	if args.RequestTerm < currentTerm {
 		Debug(dFollower, "S%d <- S%d, reject AppendEntries log, currentTerm: %d, peerTerm: %d", rf.me, args.LeaderId, rf.currentTerm, peerTerm)
@@ -425,20 +424,18 @@ func (rf *Raft) goSendAppendEntriesAndHandle(server int, args *AppendEntriesArgs
 		return
 	}
 
-	{
-		// if AppendEntries found a higher term, fall back to follower, and should stop candidateProcess
-		rf.raftLock.Lock()
-		defer rf.raftLock.Unlock()
-		peerTerm := reply.ReplyTerm
-		if peerTerm > rf.currentTerm {
-			Debug(dRole, "S%d -> S%d, saw higher term in AppendEntries Reply, currentTerm: %d, peerTerm: %d", rf.me, server, rf.currentTerm, peerTerm)
-			// fall back to follower state
-			rf.currentTerm = peerTerm
-			rf.role = Follower
-			rf.votedFor = -1
-			rf.resetElectionTimer()
-			return
-		}
+	// if AppendEntries found a higher term, fall back to follower, and should stop candidateProcess
+	rf.raftLock.Lock()
+	defer rf.raftLock.Unlock()
+	peerTerm := reply.ReplyTerm
+	if peerTerm > rf.currentTerm {
+		Debug(dRole, "S%d -> S%d, saw higher term in AppendEntries Reply, currentTerm: %d, peerTerm: %d", rf.me, server, rf.currentTerm, peerTerm)
+		// fall back to follower state
+		rf.currentTerm = peerTerm
+		rf.role = Follower
+		rf.votedFor = -1
+		rf.resetElectionTimer()
+		return
 	}
 }
 
@@ -449,23 +446,23 @@ func (rf *Raft) hasCurrentTermChangedDuringRpc(server int, termInRpcRequest int)
 }
 
 // TODO should we compare with rf.currentTerm or the term included in the original RPC ?
-func (rf *Raft) checkTermAndFallBackToFollower(term int) bool {
-	rf.raftLock.Lock()
-	defer rf.raftLock.Unlock()
-
-	// TODO how to convert back to follower ? How to know the states ? Just stop any Candidate or Leader go routine ?
-	if term > rf.currentTerm {
-		// fall back to follower state
-		rf.currentTerm = term
-		rf.role = Follower
-		// TODO when converting back to follower, should we reset the Timer ? should we reset the votedFor ?
-		rf.votedFor = -1
-		rf.resetElectionTimer()
-		return true
-	} else {
-		return false
-	}
-}
+//func (rf *Raft) checkTermAndFallBackToFollower(term int) bool {
+//	rf.raftLock.Lock()
+//	defer rf.raftLock.Unlock()
+//
+//	// TODO how to convert back to follower ? How to know the states ? Just stop any Candidate or Leader go routine ?
+//	if term > rf.currentTerm {
+//		// fall back to follower state
+//		rf.currentTerm = term
+//		rf.role = Follower
+//		// TODO when converting back to follower, should we reset the Timer ? should we reset the votedFor ?
+//		rf.votedFor = -1
+//		rf.resetElectionTimer()
+//		return true
+//	} else {
+//		return false
+//	}
+//}
 
 //
 // the service using Raft (e.g. a k/v server) wants to start
@@ -522,37 +519,35 @@ func (rf *Raft) ticker() {
 		// be started and to randomize sleeping time using
 		// time.Sleep().
 		// TODO is the lock reentrant ?
-		rf.electionTimerStartTimeLock.Lock()
+		rf.raftLock.Lock()
+		role := rf.role
 		electionTimerStartTime := rf.electionTimerStartTime
-		rf.electionTimerStartTimeLock.Unlock()
+		rf.raftLock.Unlock()
+		// only pause election timeout ticker when in leader role
+		if role == Leader {
+			time.Sleep(50 * time.Millisecond)
+			continue
+		}
 
-		if rf.checkShouldStartElection(electionTimerStartTime) {
+		now := time.Now()
+		if now.Sub(electionTimerStartTime).Milliseconds() >= rf.ElectionTimeout {
 			Debug(dTimer, "S%d election timer triggered, startTime: %d, currentTime: %d", rf.me, GetTimeSinceStart(electionTimerStartTime), GetTimeSinceStart(time.Now()))
 			rf.resetElectionTimer()
-			go rf.goCandidateStartNewElection()
+			// TODO here the lock is not continuous, will it cause any trouble ?
+			requests, replys, candidateTerm:= rf.candidatePrepareNewElection()
+			go rf.goCandidateStartNewElection(requests, replys, candidateTerm)
 		} else {
-			nextScheduledTime := rf.sleepUntilNextPossibleElectionTimeout(electionTimerStartTime)
-			Debug(dTimer, "S%d Next possible Election timeout scheduled to: %d", rf.me, GetTimeSinceStart(nextScheduledTime))
+			time.Sleep(electionTimerStartTime.Add(time.Duration(rf.ElectionTimeout) * time.Millisecond).Sub(now))
 		}
+
 	}
 	Debug(dInfo, "S%d Killed, exit ticker", rf.me)
 }
 
-// only start election when in follower mode
-func (rf *Raft) checkShouldStartElection(electionTimerStartTime time.Time) bool {
-	role, _ := rf.getRoleAndTerm()
-	return role == Follower && time.Now().Sub(electionTimerStartTime).Milliseconds() >= rf.ElectionTimeout
-}
-
-func (rf *Raft) sleepUntilNextPossibleElectionTimeout(electionTimerStartTime time.Time) time.Time {
-	time.Sleep(electionTimerStartTime.Add(time.Duration(rf.ElectionTimeout) * time.Millisecond).Sub(time.Now()))
-	return electionTimerStartTime.Add(time.Duration(rf.ElectionTimeout))
-}
-
 // reset the election timeout timer to time.Now()
 func (rf *Raft) resetElectionTimer() {
-	rf.electionTimerStartTimeLock.Lock()
-	defer rf.electionTimerStartTimeLock.Unlock()
+	//rf.electionTimerStartTimeLock.Lock()
+	//defer rf.electionTimerStartTimeLock.Unlock()
 	newStartTime := time.Now()
 	Debug(dTimer, "S%d reset Election Timer, newStartTime: %d", rf.me, GetTimeSinceStart(newStartTime))
 	rf.electionTimerStartTime = newStartTime
@@ -560,11 +555,12 @@ func (rf *Raft) resetElectionTimer() {
 }
 
 // Candidate Related Methods
-func (rf *Raft) goCandidateStartNewElection() {
+
+func (rf *Raft) candidatePrepareNewElection() ([]RequestVoteArgs, []RequestVoteReply, int) {
 	Debug(dCandidate, "S%d candidate start election", rf.me)
 	Debug(dLock, "S%d acquiring raftLock", rf.me)
-
 	rf.raftLock.Lock()
+	defer rf.raftLock.Unlock()
 
 	rf.currentTerm = rf.currentTerm + 1
 	rf.votedFor = rf.me
@@ -585,8 +581,9 @@ func (rf *Raft) goCandidateStartNewElection() {
 		}
 		replys[i] = RequestVoteReply{}
 	}
-
-	rf.raftLock.Unlock()
+	return requests, replys, rf.currentTerm
+}
+func (rf *Raft) goCandidateStartNewElection(requests []RequestVoteArgs, replys []RequestVoteReply, thisElectionTerm int) {
 	Debug(dLock, "S%d released raftLock", rf.me)
 
 	// TODO do we need to retry here ? Or it automatically retry for us ?
@@ -611,6 +608,7 @@ func (rf *Raft) goCandidateStartNewElection() {
 			return
 		}
 		// this means the new election has started, we should give up this election
+		// TODO this is not working bro.
 		if term != thisElectionTerm {
 			Debug(dCandidate, "S%d candi's term changed while waiting for votes, should be %d but is %d", rf.me, thisElectionTerm, term)
 			return
@@ -654,6 +652,7 @@ func (rf *Raft) goLeaderStartNewTerm(termOfCandidate int) {
 		// time.Sleep().
 		lastAppendEntriesTime := rf.getLastSendAppendEntriesTime()
 
+		// TODO needs to be updated as well.
 		if lastAppendEntriesTime.IsZero() || time.Now().Sub(lastAppendEntriesTime).Milliseconds() >= HeartBeatIntervalMs {
 			// TODO do we go here ? wee do not need to go here because we can fire and forget
 			rf.goLeaderSendHeartBeats(termOfCandidate)
