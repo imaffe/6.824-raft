@@ -534,6 +534,7 @@ func (rf *Raft) ticker() {
 		rf.raftLock.Lock()
 		role := rf.role
 		electionTimerStartTime := rf.electionTimerStartTime
+		electionTimeout := rf.ElectionTimeout
 		rf.raftLock.Unlock()
 		// only pause election timeout ticker when in leader role
 		if role == Leader {
@@ -542,14 +543,13 @@ func (rf *Raft) ticker() {
 		}
 
 		now := time.Now()
-		if now.Sub(electionTimerStartTime).Milliseconds() >= rf.ElectionTimeout {
+		if now.Sub(electionTimerStartTime).Milliseconds() >= electionTimeout {
 			Debug(dTimer, "S%d election timer triggered, startTime: %d, currentTime: %d", rf.me, GetTimeSinceStart(electionTimerStartTime), GetTimeSinceStart(time.Now()))
-			rf.resetElectionTimer()
 			// TODO here the lock is not continuous, will it cause any trouble ?
 			requests, replys, candidateTerm:= rf.candidatePrepareNewElection()
 			go rf.goCandidateStartNewElection(requests, replys, candidateTerm)
 		} else {
-			time.Sleep(electionTimerStartTime.Add(time.Duration(rf.ElectionTimeout) * time.Millisecond).Sub(now))
+			time.Sleep(electionTimerStartTime.Add(time.Duration(electionTimeout) * time.Millisecond).Sub(now))
 		}
 
 	}
@@ -563,6 +563,7 @@ func (rf *Raft) resetElectionTimer() {
 	newStartTime := time.Now()
 	Debug(dTimer, "S%d reset Election Timer, newStartTime: %d", rf.me, GetTimeSinceStart(newStartTime))
 	rf.electionTimerStartTime = newStartTime
+	rf.ElectionTimeout = setRandomElectionTimeout()
 	// TODO should we reset the voted for ? No
 }
 
@@ -573,6 +574,7 @@ func (rf *Raft) candidatePrepareNewElection() ([]RequestVoteArgs, []RequestVoteR
 	Debug(dLock, "S%d acquiring raftLock", rf.me)
 	rf.raftLock.Lock()
 	defer rf.raftLock.Unlock()
+	rf.resetElectionTimer()
 
 	rf.currentTerm = rf.currentTerm + 1
 	rf.votedFor = rf.me
