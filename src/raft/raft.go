@@ -143,6 +143,8 @@ type Raft struct {
 	lastSendAppendEntriesTime time.Time
 	// TODO this lock is not used
 	lastSendAppendEntriesTimeLock sync.Mutex
+
+	applyCh chan ApplyMsg
 }
 
 // return currentTerm and whether this server
@@ -521,6 +523,41 @@ func (rf *Raft) goSendAppendEntriesAndHandle(server int, args *AppendEntriesArgs
 		rf.resetElectionTimer()
 		return
 	}
+
+	// TODO the temporary new code area
+	// 1. if the leader is no longer the leader, what to do ?
+	// TODO need to think about what if some thing has changed?
+	if reply.Success {
+		// rf.nextIndex[peer] remain unchanged
+		rf.matchIndex[server] = args.PrevLogIndex + len(args.LogEntries)
+	} else {
+		// need to decrease the nextIndex
+		//rf.nextIndex[server] = rf.nextIndex[server] - 1
+		// TODO which one is correct ?
+		rf.nextIndex[server] = (args.PrevLogIndex + 1) - 1
+	}
+
+	for index := len(rf.logEntries) - 1; index > rf.commitIndex; index -- {
+		// if term is low, cannot commit any entries
+		if rf.logEntries[index].Term != rf.currentTerm {
+			break
+		}
+		// leader always count as 1
+		replicated := 1
+		for peer := range rf.peers {
+			if peer == rf.me {
+				continue
+			}
+			// TODO will matchIndex be changed here ?
+			if rf.matchIndex[server] >= index {
+				replicated++
+			}
+		}
+		if replicated >= len(rf.peers) / 2 {
+			rf.commitIndex = index
+			break
+		}
+	}
 }
 
 func (rf *Raft) hasCurrentTermChangedDuringRpc(server int, termInRpcRequest int) (bool, int) {
@@ -586,13 +623,8 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	// TODO this update is not necessary ?
 
 	// 2. send AppendEntries to peers
+	rf.goSendAppendEntriesAndHandleNew(termWhenReceivedCommand)
 
-	for peer := range rf.peers {
-		if peer == rf.me {
-			continue
-		}
-		go rf.goSendAppendEntriesAndHandleNew(peer, termWhenReceivedCommand)
-	}
 	// release lock before we enter wait status
 	rf.raftLock.Unlock()
 
@@ -600,86 +632,45 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	return newEntry.Index, newEntry.Term, true
 }
 
-func (rf *Raft) goSendAppendEntriesAndHandleNew(peer int, termWhenReceivedCommand int) {
-	rf.raftLock.Lock()
+func (rf *Raft) goSendAppendEntriesAndHandleNew(termWhenReceivedCommand int) {
 
-	nextIndex := make([]int, len(rf.nextIndex))
-	copy(nextIndex, rf.nextIndex)
-
-	matchIndex := make([]int, len(rf.matchIndex))
-	copy(matchIndex, rf.matchIndex)
-
-	commitIndex := rf.commitIndex
-
-	entries := make([]LogEntry, len(rf.logEntries[rf.nextIndex[peer]:]))
-	copy(entries, rf.logEntries[rf.nextIndex[peer]:])
-
-
-	// logEntries is guaranteed to exist at prevLogIndex
-	prevLogIndex := rf.nextIndex[peer] - 1
-	prevLogTerm := rf.logEntries[prevLogIndex].Term
-	rf.raftLock.Unlock()
-
-	// let's do not retry for now
-
-	request := AppendEntriesArgs{
-		RequestTerm: termWhenReceivedCommand,
-		LeaderId: rf.me,
-		PrevLogIndex: prevLogIndex,
-		PrevLogTerm: prevLogTerm,
-		LogEntries: entries,
-		LeaderCommit: commitIndex,
-	}
-
-	reply := AppendEntriesReply{}
-
-	rf.goSendAppendEntriesAndHandle(peer, &request, &reply)
-	// What could have changed after this call?
-	// 1. is no longer a leader
-
-	rf.raftLock.Lock()
-	// TODO this check should include term should remain unchanged.
-	if rf.role != Leader  {
-		// TODO this check is to check if the state has c
-		// return immediately after the handle process.
-		return
-	}
-
-	// TODO let's process retry as the next
-	if reply.Success {
-		// rf.nextIndex[peer] remain unchanged
-		rf.matchIndex[peer] = request.PrevLogIndex + len(request.LogEntries)
-	} else {
-		// need to decrease the
-		rf.nextIndex[peer] = rf.nextIndex[peer] - 1
-	}
-
-	// TODO check for commit, where to check commit ?
-	// Leader should set the commit index by examing the match index
-	// 3. set the commitIndex
-	for index := len(rf.logEntries) - 1; index > rf.commitIndex; index -- {
-		// if term is low, cannot commit any entries
-		if rf.logEntries[index].Term != rf.currentTerm {
-			break
+	for peer := range rf.peers {
+		if peer == rf.me {
+			continue
 		}
-		// leader always count as 1
-		replicated := 1
-		for server := range rf.peers {
-			if server == rf.me {
-				continue
-			}
-			if matchIndex[server] >= index {
-				replicated++
-			}
-		}
-		if replicated >= len(rf.peers) / 2 {
-			rf.commitIndex = index
-			break
-		}
-	}
+		// prepare data, some needs to be update
+		nextIndex := make([]int, len(rf.nextIndex))
+		copy(nextIndex, rf.nextIndex)
 
-	// TODO not sure if we can use defer in the middle? Need to do an experiement
-	rf.raftLock.Unlock()
+		matchIndex := make([]int, len(rf.matchIndex))
+		copy(matchIndex, rf.matchIndex)
+
+		commitIndex := rf.commitIndex
+
+		entries := make([]LogEntry, len(rf.logEntries[rf.nextIndex[peer]:]))
+		copy(entries, rf.logEntries[rf.nextIndex[peer]:])
+
+
+		// logEntries is guaranteed to exist at prevLogIndex
+		prevLogIndex := rf.nextIndex[peer] - 1
+		prevLogTerm := rf.logEntries[prevLogIndex].Term
+		rf.raftLock.Unlock()
+
+		// let's do not retry for now
+
+		request := AppendEntriesArgs{
+			RequestTerm: termWhenReceivedCommand,
+			LeaderId: rf.me,
+			PrevLogIndex: prevLogIndex,
+			PrevLogTerm: prevLogTerm,
+			LogEntries: entries,
+			LeaderCommit: commitIndex,
+		}
+
+		reply := AppendEntriesReply{}
+
+		go rf.goSendAppendEntriesAndHandle(peer, &request, &reply)
+	}
 }
 
 //
@@ -736,6 +727,38 @@ func (rf *Raft) ticker() {
 
 	}
 	Debug(dInfo, "S%d Killed, exit ticker", rf.me)
+}
+
+func (rf *Raft) applier() {
+	for rf.killed() == false {
+
+
+		var msgsToApply []ApplyMsg
+		rf.raftLock.Lock()
+		if rf.commitIndex > rf.lastApplied {
+			msgsToApply = make([]ApplyMsg, rf.commitIndex - rf.lastApplied)
+			for index := rf.lastApplied + 1; index <= rf.commitIndex; index++ {
+				msgsToApply[index- (rf.lastApplied + 1)] = ApplyMsg{
+					CommandValid:  true,
+					Command:       rf.logEntries[index].Command,
+					CommandIndex:  rf.logEntries[index].Index,
+					SnapshotValid: false,
+					Snapshot:      nil,
+					SnapshotTerm:  0,
+					SnapshotIndex: 0,
+				}
+			}
+		}
+		rf.raftLock.Unlock()
+
+		// TODO this method could block
+		for i := range msgsToApply {
+			rf.applyCh <- msgsToApply[i]
+		}
+
+		// set the sleep interval
+		time.Sleep(100 * time.Millisecond)
+	}
 }
 
 // reset the election timeout timer to time.Now()
@@ -942,6 +965,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.peers = peers
 	rf.persister = persister
 	rf.me = me
+	rf.applyCh = applyCh
 
 	Init()
 	// Your initialization code here (2A, 2B, 2C).
@@ -953,6 +977,8 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 	// start ticker goroutine to start elections
 	go rf.ticker()
+
+	go rf.applier()
 
 	return rf
 }
