@@ -18,6 +18,7 @@ package raft
 //
 
 import (
+	"math"
 	"math/rand"
 	"runtime"
 	"strconv"
@@ -222,8 +223,8 @@ type RequestVoteArgs struct {
 	// Your data here (2A, 2B).
 	RequestTerm int
 	CandidateId int
-	//lastLogIndex int64
-	//lastLogTerm int
+	LastLogIndex int
+	LastLogTerm int
 }
 
 //
@@ -275,18 +276,36 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// if not voted, then vote, this does not involve candidateId
 	if votedFor == -1 {
 		// TODO now always return true, don't check the log
-		reply.ReplyTerm = currentTerm
-		reply.VoteGranted = true
-		rf.votedFor = args.CandidateId
-		// TODO seems we don't need to reset the timer here, but doesn't matter
-		rf.resetElectionTimer()
-		Debug(dVote, "S%d <- S%d, Request Vote Granted, currentTerm: %d, peerTerm: %d", rf.me, args.CandidateId, currentTerm, peerTerm)
-		return
+
+		if rf.isAsUpToDate(args) {
+			reply.ReplyTerm = currentTerm
+			reply.VoteGranted = true
+			rf.votedFor = args.CandidateId
+			// TODO seems we don't need to reset the timer here, but doesn't matter
+			rf.resetElectionTimer()
+			Debug(dVote, "S%d <- S%d, Request Vote Granted, currentTerm: %d, peerTerm: %d", rf.me, args.CandidateId, currentTerm, peerTerm)
+			return
+		} else {
+			reply.ReplyTerm = currentTerm
+			reply.VoteGranted = false
+			Debug(dVote, "S%d <- S%d, Request Vote rejected, already voted, currentTerm: %d, peerTerm: %d", rf.me, args.CandidateId, currentTerm, peerTerm)
+			return
+		}
 	} else {
 		reply.ReplyTerm = currentTerm
 		reply.VoteGranted = false
 		Debug(dVote, "S%d <- S%d, Request Vote rejected, already voted, currentTerm: %d, peerTerm: %d", rf.me, args.CandidateId, currentTerm, peerTerm)
 		return
+	}
+}
+
+func (rf *Raft) isAsUpToDate(args *RequestVoteArgs) bool {
+	if args.LastLogTerm > rf.logEntries[len(rf.logEntries) - 1].Term {
+		return true
+	} else if args.LastLogTerm < rf.logEntries[len(rf.logEntries) - 1].Term {
+		return false
+	} else {
+		return args.LastLogIndex >= len(rf.logEntries) - 1
 	}
 }
 
@@ -404,15 +423,57 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		// We need to make sure the leader process will be stopped
 	}
 
+	// continue to process the request
 	currentTerm := rf.currentTerm
-
-
 	if args.RequestTerm < currentTerm {
 		Debug(dFollower, "S%d <- S%d, reject AppendEntries log, currentTerm: %d, peerTerm: %d", rf.me, args.LeaderId, rf.currentTerm, peerTerm)
 		reply.ReplyTerm = currentTerm
 		reply.Success = false
 	} else {
+
+		// prevLogIndex points beyond current index
+		if args.PrevLogIndex >= len(rf.logEntries) {
+			reply.ReplyTerm = currentTerm
+			reply.Success = false
+			rf.resetElectionTimer()
+		}
+
+		// prevLogI
+		if rf.logEntries[args.PrevLogIndex].Term != args.PrevLogTerm {
+			reply.ReplyTerm = currentTerm
+			reply.Success = false
+			rf.resetElectionTimer()
+		}
+		// TODO what if prevLogIndex is 0 ? The term and index all matches, meaning they should accept the log
+
+		// Then we should merge the new entries with the current entries
 		Debug(dFollower, "S%d <- S%d, accepted AppendEntries, currentTerm: %d, peerTerm: %d", rf.me, args.LeaderId, rf.currentTerm, peerTerm)
+
+		// TODO what if this is a heartbeat message ? Is this implementation safe ?
+		newEntriesStartIndex := args.PrevLogIndex + 1
+
+		// TODO might want to revisit this logic here
+		for i := range args.LogEntries {
+			// try append, and truncate if mismatch
+			if newEntriesStartIndex + i < len(rf.logEntries) {
+				if args.LogEntries[i].Term != rf.logEntries[newEntriesStartIndex + i].Term {
+					// remove all after it
+					rf.logEntries = rf.logEntries[:newEntriesStartIndex + i ]
+					rf.logEntries = append(rf.logEntries, args.LogEntries[i:]...)
+					break
+				}
+			} else {
+				// stopped at the logEntries
+				rf.logEntries = append(rf.logEntries, args.LogEntries[i:]...)
+				break
+			}
+		}
+		// 5. check commit index
+		if args.LeaderCommit > rf.commitIndex {
+			rf.commitIndex = min(args.LeaderCommit, len(rf.logEntries) - 1)
+		}
+
+
 		reply.ReplyTerm = currentTerm
 		reply.Success = true
 		rf.resetElectionTimer()
@@ -530,7 +591,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		if peer == rf.me {
 			continue
 		}
-		go rf.goSendAppendEntriesFromLeader(peer, termWhenReceivedCommand)
+		go rf.goSendAppendEntriesAndHandleNew(peer, termWhenReceivedCommand)
 	}
 	// release lock before we enter wait status
 	rf.raftLock.Unlock()
@@ -713,6 +774,8 @@ func (rf *Raft) candidatePrepareNewElection() ([]RequestVoteArgs, []RequestVoteR
 		requests[i] = RequestVoteArgs{
 			RequestTerm: thisElectionTerm,
 			CandidateId: rf.me,
+			LastLogIndex: len(rf.logEntries) - 1,
+			LastLogTerm: rf.logEntries[len(rf.logEntries) - 1].Term,
 		}
 		replys[i] = RequestVoteReply{}
 	}
@@ -933,4 +996,11 @@ func GoID() int {
 		panic(err)
 	}
 	return id
+}
+
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
 }
