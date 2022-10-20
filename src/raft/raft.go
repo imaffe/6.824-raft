@@ -95,6 +95,12 @@ type ApplyMsg struct {
 
 type Role int
 
+type LogEntry struct {
+	Term int
+	Index int
+	Command interface{}
+}
+
 //
 // A Go object implementing a single Raft peer.
 //
@@ -112,14 +118,15 @@ type Raft struct {
 	// persist: all servers
 	currentTerm int
 	votedFor    int
+	logEntries  []LogEntry
 
 	// volatile: all servers
-	commitIndex int64
-	lastApplied int64
+	commitIndex int
+	lastApplied int
 
 	// volatile: leader only
-	nextIndex  []int64
-	matchIndex []int64
+	nextIndex  []int
+	matchIndex []int
 
 	// electionTimer vars and it's locks
 	electionTimerStartTime     time.Time
@@ -366,7 +373,11 @@ func (rf *Raft) goSendRequestVoteAndHandle(server int, args *RequestVoteArgs, re
 type AppendEntriesArgs struct {
 	RequestTerm int
 	LeaderId    int
-	// The remaining won't be used now
+	// The following are used in 2B
+	PrevLogIndex int
+	PrevLogTerm int
+	LogEntries []LogEntry
+	LeaderCommit int
 }
 
 type AppendEntriesReply struct {
@@ -491,13 +502,123 @@ func (rf *Raft) hasCurrentTermChangedDuringRpc(server int, termInRpcRequest int)
 // the leader.
 //
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
-	index := -1
-	term := -1
-	isLeader := true
-
 	// Your code here (2B).
+	// TODO possible dead lock here ?
+	rf.raftLock.Lock()
+	// Proceed as Leader take a snapshot of the data we will be using to start the process
+	termWhenReceivedCommand := rf.currentTerm
+	role := rf.role
 
-	return index, term, isLeader
+
+	if role != Leader {
+		rf.raftLock.Unlock()
+		return -1, termWhenReceivedCommand, false
+	}
+
+	// 1. append to local entry
+	newEntry := LogEntry{
+		Term: termWhenReceivedCommand,
+		Index: len(rf.logEntries),
+		Command: command,
+	}
+	rf.logEntries = append(rf.logEntries, newEntry)
+	// TODO this update is not necessary ?
+
+	// 2. send AppendEntries to peers
+
+	for peer := range rf.peers {
+		if peer == rf.me {
+			continue
+		}
+		go rf.goSendAppendEntriesFromLeader(peer, termWhenReceivedCommand)
+	}
+	// release lock before we enter wait status
+	rf.raftLock.Unlock()
+
+	// 3. wait for the results
+	return newEntry.Index, newEntry.Term, true
+}
+
+func (rf *Raft) goSendAppendEntriesAndHandleNew(peer int, termWhenReceivedCommand int) {
+	rf.raftLock.Lock()
+
+	nextIndex := make([]int, len(rf.nextIndex))
+	copy(nextIndex, rf.nextIndex)
+
+	matchIndex := make([]int, len(rf.matchIndex))
+	copy(matchIndex, rf.matchIndex)
+
+	commitIndex := rf.commitIndex
+
+	entries := make([]LogEntry, len(rf.logEntries[rf.nextIndex[peer]:]))
+	copy(entries, rf.logEntries[rf.nextIndex[peer]:])
+
+
+	// logEntries is guaranteed to exist at prevLogIndex
+	prevLogIndex := rf.nextIndex[peer] - 1
+	prevLogTerm := rf.logEntries[prevLogIndex].Term
+	rf.raftLock.Unlock()
+
+	// let's do not retry for now
+
+	request := AppendEntriesArgs{
+		RequestTerm: termWhenReceivedCommand,
+		LeaderId: rf.me,
+		PrevLogIndex: prevLogIndex,
+		PrevLogTerm: prevLogTerm,
+		LogEntries: entries,
+		LeaderCommit: commitIndex,
+	}
+
+	reply := AppendEntriesReply{}
+
+	rf.goSendAppendEntriesAndHandle(peer, &request, &reply)
+	// What could have changed after this call?
+	// 1. is no longer a leader
+
+	rf.raftLock.Lock()
+	// TODO this check should include term should remain unchanged.
+	if rf.role != Leader  {
+		// TODO this check is to check if the state has c
+		// return immediately after the handle process.
+		return
+	}
+
+	// TODO let's process retry as the next
+	if reply.Success {
+		// rf.nextIndex[peer] remain unchanged
+		rf.matchIndex[peer] = request.PrevLogIndex + len(request.LogEntries)
+	} else {
+		// need to decrease the
+		rf.nextIndex[peer] = rf.nextIndex[peer] - 1
+	}
+
+	// TODO check for commit, where to check commit ?
+	// Leader should set the commit index by examing the match index
+	// 3. set the commitIndex
+	for index := len(rf.logEntries) - 1; index > rf.commitIndex; index -- {
+		// if term is low, cannot commit any entries
+		if rf.logEntries[index].Term != rf.currentTerm {
+			break
+		}
+		// leader always count as 1
+		replicated := 1
+		for server := range rf.peers {
+			if server == rf.me {
+				continue
+			}
+			if matchIndex[server] >= index {
+				replicated++
+			}
+		}
+		if replicated >= len(rf.peers) / 2 {
+			rf.commitIndex = index
+			break
+		}
+	}
+
+	// TODO not sure if we can use defer in the middle? Need to do an experiement
+	rf.raftLock.Unlock()
 }
 
 //
@@ -637,6 +758,10 @@ func (rf *Raft) goCandidateStartNewElection(requests []RequestVoteArgs, replys [
 	if rf.hasEnoughVotes(int(atomic.LoadInt64(&votesGranted))) && rf.role == Candidate {
 		Debug(dCandidate, "S%d got enough votes, will become leader", rf.me)
 		rf.role = Leader
+		for peer := range rf.nextIndex {
+			rf.nextIndex[peer] = len(rf.logEntries)
+			rf.matchIndex[peer] = 0
+		}
 		Debug(dRole, "S%d Role set to Leader", rf.me)
 		go rf.goLeaderStartNewTerm(rf.currentTerm)
 
@@ -698,6 +823,7 @@ func (rf *Raft) goLeaderSendHeartBeats(termOfCandidate int) {
 		if peer == rf.me {
 			continue
 		}
+		// TODO this needs to be changed as well
 		go rf.goSendAppendEntriesAndHandle(peer, &requests[peer], &replys[peer])
 	}
 	// do not need to wait for results
@@ -778,9 +904,11 @@ func initializeRaftAsFollower(rf *Raft) {
 	rf.commitIndex = 0
 	rf.lastApplied = 0
 	// TODO volatile leader field, not used in 2A yet.
-	rf.nextIndex = make([]int64, len(rf.peers))
-	rf.matchIndex = make([]int64, len(rf.peers))
-
+	rf.nextIndex = make([]int, len(rf.peers))
+	rf.matchIndex = make([]int, len(rf.peers))
+	// Initialize the logEntries to have a length 1
+	rf.logEntries = make([]LogEntry, 1)
+	rf.logEntries[0] = LogEntry{}
 	// other vars
 	rf.electionTimerStartTime = time.Now()
 	rf.ElectionTimeout = setRandomElectionTimeout()
