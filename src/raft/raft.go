@@ -18,7 +18,6 @@ package raft
 //
 
 import (
-	"math"
 	"math/rand"
 	"runtime"
 	"strconv"
@@ -438,6 +437,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			reply.ReplyTerm = currentTerm
 			reply.Success = false
 			rf.resetElectionTimer()
+			return
 		}
 
 		// prevLogI
@@ -445,6 +445,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			reply.ReplyTerm = currentTerm
 			reply.Success = false
 			rf.resetElectionTimer()
+			return
 		}
 		// TODO what if prevLogIndex is 0 ? The term and index all matches, meaning they should accept the log
 
@@ -654,7 +655,7 @@ func (rf *Raft) goSendAppendEntriesAndHandleNew(termWhenReceivedCommand int) {
 		// logEntries is guaranteed to exist at prevLogIndex
 		prevLogIndex := rf.nextIndex[peer] - 1
 		prevLogTerm := rf.logEntries[prevLogIndex].Term
-		rf.raftLock.Unlock()
+
 
 		// let's do not retry for now
 
@@ -880,7 +881,8 @@ func (rf *Raft) goLeaderStartNewTerm(termOfCandidate int) {
 		// TODO needs to be updated as well.
 		if lastAppendEntriesTime.IsZero() || time.Now().Sub(lastAppendEntriesTime).Milliseconds() >= HeartBeatIntervalMs {
 			// TODO do we go here ? wee do not need to go here because we can fire and forget
-			rf.goLeaderSendHeartBeats(termOfCandidate)
+			//rf.goLeaderSendHeartBeats(termOfCandidate)
+			rf.goSendAppendEntriesAndHandleNew(termOfCandidate)
 			rf.refreshLastSendAppendEntriesTime()
 		} else {
 			time.Sleep(lastAppendEntriesTime.Add(time.Duration(HeartBeatIntervalMs) * time.Millisecond).Sub(time.Now()))
