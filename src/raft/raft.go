@@ -529,8 +529,9 @@ func (rf *Raft) goSendAppendEntriesAndHandle(server int, args *AppendEntriesArgs
 	// 1. if the leader is no longer the leader, what to do ?
 	// TODO need to think about what if some thing has changed?
 	if reply.Success {
-		// rf.nextIndex[peer] remain unchanged
+		// rf.nextIndex[peer] remain unchanged, TODO why remain unchanged ?
 		rf.matchIndex[server] = args.PrevLogIndex + len(args.LogEntries)
+		rf.nextIndex[server] = rf.matchIndex[server] + 1
 	} else {
 		// need to decrease the nextIndex
 		//rf.nextIndex[server] = rf.nextIndex[server] - 1
@@ -554,7 +555,7 @@ func (rf *Raft) goSendAppendEntriesAndHandle(server int, args *AppendEntriesArgs
 				replicated++
 			}
 		}
-		if replicated >= len(rf.peers) / 2 {
+		if replicated > len(rf.peers) / 2 {
 			rf.commitIndex = index
 			break
 		}
@@ -625,7 +626,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 
 	// 2. send AppendEntries to peers
 	rf.goSendAppendEntriesAndHandleNew(termWhenReceivedCommand)
-
+	rf.refreshLastSendAppendEntriesTime()
 	// release lock before we enter wait status
 	rf.raftLock.Unlock()
 
@@ -882,7 +883,9 @@ func (rf *Raft) goLeaderStartNewTerm(termOfCandidate int) {
 		if lastAppendEntriesTime.IsZero() || time.Now().Sub(lastAppendEntriesTime).Milliseconds() >= HeartBeatIntervalMs {
 			// TODO do we go here ? wee do not need to go here because we can fire and forget
 			//rf.goLeaderSendHeartBeats(termOfCandidate)
+			rf.raftLock.Lock()
 			rf.goSendAppendEntriesAndHandleNew(termOfCandidate)
+			rf.raftLock.Unlock()
 			rf.refreshLastSendAppendEntriesTime()
 		} else {
 			time.Sleep(lastAppendEntriesTime.Add(time.Duration(HeartBeatIntervalMs) * time.Millisecond).Sub(time.Now()))
