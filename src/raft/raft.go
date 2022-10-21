@@ -430,6 +430,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		Debug(dFollower, "S%d <- S%d, reject AppendEntries log, currentTerm: %d, peerTerm: %d", rf.me, args.LeaderId, rf.currentTerm, peerTerm)
 		reply.ReplyTerm = currentTerm
 		reply.Success = false
+		return
 	} else {
 
 		// prevLogIndex points beyond current index
@@ -473,6 +474,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		}
 		// 5. check commit index
 		if args.LeaderCommit > rf.commitIndex {
+			Debug(dCommit, "S%d <- S%d, received higher leader commit index %d, current %d, lastLog %d",rf.me, args.LeaderId, args.LeaderCommit, rf.commitIndex, len(rf.logEntries) - 1)
 			rf.commitIndex = min(args.LeaderCommit, len(rf.logEntries) - 1)
 		}
 
@@ -480,6 +482,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		reply.ReplyTerm = currentTerm
 		reply.Success = true
 		rf.resetElectionTimer()
+		return
 	}
 }
 
@@ -530,12 +533,15 @@ func (rf *Raft) goSendAppendEntriesAndHandle(server int, args *AppendEntriesArgs
 	// TODO need to think about what if some thing has changed?
 	if reply.Success {
 		// rf.nextIndex[peer] remain unchanged, TODO why remain unchanged ?
+		// TODO will matchIndex decrease ?
+		Debug(dLeader, "S%d <- S%d appendEntries accepted by peer, s", rf.me, server, )
 		rf.matchIndex[server] = args.PrevLogIndex + len(args.LogEntries)
 		rf.nextIndex[server] = rf.matchIndex[server] + 1
 	} else {
 		// need to decrease the nextIndex
 		//rf.nextIndex[server] = rf.nextIndex[server] - 1
 		// TODO which one is correct ?
+		// TODO will it fall back ?
 		rf.nextIndex[server] = (args.PrevLogIndex + 1) - 1
 	}
 
@@ -551,11 +557,13 @@ func (rf *Raft) goSendAppendEntriesAndHandle(server int, args *AppendEntriesArgs
 				continue
 			}
 			// TODO will matchIndex be changed here ?
-			if rf.matchIndex[server] >= index {
+			if rf.matchIndex[peer] >= index {
+				Debug(dCommit, "S%d <- S%d peer has match index larger than %d",rf.me, peer, index)
 				replicated++
 			}
 		}
 		if replicated > len(rf.peers) / 2 {
+			Debug(dCommit, "S%d commit index %d, replicated %d",rf.me, index, replicated)
 			rf.commitIndex = index
 			break
 		}
@@ -896,29 +904,29 @@ func (rf *Raft) goLeaderStartNewTerm(termOfCandidate int) {
 	}
 }
 
-func (rf *Raft) goLeaderSendHeartBeats(termOfCandidate int) {
-	// take a snapshot in case the term change suddenly
-	Debug(dLeader, "S%d Leader Start sending heartBeat,candidateTerm:%d", rf.me, termOfCandidate)
-	requests := make([]AppendEntriesArgs, len(rf.peers))
-	replys := make([]AppendEntriesReply, len(rf.peers))
-
-	for i := range requests {
-		requests[i] = AppendEntriesArgs{
-			RequestTerm: termOfCandidate,
-			LeaderId:    rf.me,
-		}
-		replys[i] = AppendEntriesReply{}
-	}
-
-	for peer := range rf.peers {
-		if peer == rf.me {
-			continue
-		}
-		// TODO this needs to be changed as well
-		go rf.goSendAppendEntriesAndHandle(peer, &requests[peer], &replys[peer])
-	}
-	// do not need to wait for results
-}
+//func (rf *Raft) goLeaderSendHeartBeats(termOfCandidate int) {
+//	// take a snapshot in case the term change suddenly
+//	Debug(dLeader, "S%d Leader Start sending heartBeat,candidateTerm:%d", rf.me, termOfCandidate)
+//	requests := make([]AppendEntriesArgs, len(rf.peers))
+//	replys := make([]AppendEntriesReply, len(rf.peers))
+//
+//	for i := range requests {
+//		requests[i] = AppendEntriesArgs{
+//			RequestTerm: termOfCandidate,
+//			LeaderId:    rf.me,
+//		}
+//		replys[i] = AppendEntriesReply{}
+//	}
+//
+//	for peer := range rf.peers {
+//		if peer == rf.me {
+//			continue
+//		}
+//		// TODO this needs to be changed as well
+//		go rf.goSendAppendEntriesAndHandle(peer, &requests[peer], &replys[peer])
+//	}
+//	// do not need to wait for results
+//}
 
 func (rf *Raft) getLastSendAppendEntriesTime() time.Time {
 	rf.lastSendAppendEntriesTimeLock.Lock()

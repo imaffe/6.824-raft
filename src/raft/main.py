@@ -17,6 +17,7 @@ TOPICS = {
     "VOTE": "green",
     "LEAD": "blue",
     "FOLW": "pink",
+    "CMIT": "yellow",
 }
 
 topics = {
@@ -29,6 +30,7 @@ topics = {
     "VOTE",
     "LEAD",
     "FOLW",
+    "CMIT",
 }
 
 
